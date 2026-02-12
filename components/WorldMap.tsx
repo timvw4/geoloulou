@@ -62,6 +62,7 @@ export default function WorldMap({
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [start, setStart] = useState({ x: 0, y: 0 });
+  const [isMobile, setIsMobile] = useState(false);
   const focusRef = useRef({ x: 450, y: 225 });
   const [selected, setSelected] = useState<{
     iso: string;
@@ -70,6 +71,11 @@ export default function WorldMap({
     flag?: string;
   } | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const pinchRef = useRef<{
+    initialDistance: number;
+    initialZoom: number;
+    modelCenter: { x: number; y: number };
+  } | null>(null);
 
   const { collection, projection } = useMemo(() => {
     const topo = worldData as unknown as Topology;
@@ -134,6 +140,15 @@ export default function WorldMap({
     focusRef.current = { x: modelX, y: modelY };
   };
 
+  // Détection mobile (pointer coarse) pour ajuster l'UI et le touch-action
+  useEffect(() => {
+    const isCoarse =
+      typeof window !== "undefined" &&
+      window.matchMedia &&
+      window.matchMedia("(pointer: coarse)").matches;
+    setIsMobile(isCoarse);
+  }, []);
+
   // Remet la vue par défaut quand resetKey change (nouvelle question)
   useEffect(() => {
     setZoom(1.1);
@@ -175,25 +190,27 @@ export default function WorldMap({
     <div className="w-full">
       <div className="flex items-center gap-3 mb-2">
         <p className="text-xs text-slate-300 min-w-[72px]">Zoom: {zoom.toFixed(1)}x</p>
-        <input
-          type="range"
-          min={1.1}
-          max={50}
-          step={0.1}
-          value={zoom}
-          onChange={(e) => {
-            const nextZoom = parseFloat(e.target.value);
-            const currentZoom = zoom;
-            const model = focusRef.current;
-            setOffset((prev) => ({
-              x: prev.x + model.x * (currentZoom - nextZoom),
-              y: prev.y + model.y * (currentZoom - nextZoom),
-            }));
-            setZoom(nextZoom);
-          }}
-          className="flex-1 accent-cyan-400"
-          aria-label="Réglage du zoom"
-        />
+        {!isMobile && (
+          <input
+            type="range"
+            min={1.1}
+            max={50}
+            step={0.1}
+            value={zoom}
+            onChange={(e) => {
+              const nextZoom = parseFloat(e.target.value);
+              const currentZoom = zoom;
+              const model = focusRef.current;
+              setOffset((prev) => ({
+                x: prev.x + model.x * (currentZoom - nextZoom),
+                y: prev.y + model.y * (currentZoom - nextZoom),
+              }));
+              setZoom(nextZoom);
+            }}
+            className="flex-1 accent-cyan-400"
+            aria-label="Réglage du zoom"
+          />
+        )}
         <button
           onClick={() => {
             setZoom(1.1);
@@ -210,8 +227,11 @@ export default function WorldMap({
         viewBox="0 0 900 450"
         role="img"
         aria-label="Carte du monde interactive"
-        style={{ height }}
-        className="rounded-2xl w-full card touch-pan-y touch-pinch-zoom"
+        className="rounded-2xl w-full card"
+        style={{
+          height,
+          touchAction: isMobile ? "none" : "auto",
+        }}
         onMouseDown={(e) => {
           setDragging(true);
           setStart({ x: e.clientX - offset.x, y: e.clientY - offset.y });
@@ -225,18 +245,64 @@ export default function WorldMap({
         onMouseUp={() => setDragging(false)}
         onMouseLeave={() => setDragging(false)}
         onTouchStart={(e) => {
-          const t = e.touches[0];
-          setDragging(true);
-          setStart({ x: t.clientX - offset.x, y: t.clientY - offset.y });
-          updateFocusFromEvent(t.clientX, t.clientY);
+          if (e.touches.length === 2) {
+            e.preventDefault();
+            const [t1, t2] = [e.touches[0], e.touches[1]];
+            const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+            const centerX = (t1.clientX + t2.clientX) / 2;
+            const centerY = (t1.clientY + t2.clientY) / 2;
+            const rect = svgRef.current?.getBoundingClientRect();
+            if (!rect) return;
+            const modelX = (centerX - rect.left - offset.x) / zoom;
+            const modelY = (centerY - rect.top - offset.y) / zoom;
+            pinchRef.current = {
+              initialDistance: dist,
+              initialZoom: zoom,
+              modelCenter: { x: modelX, y: modelY },
+            };
+            setDragging(false);
+          } else if (e.touches.length === 1) {
+            e.preventDefault();
+            const t = e.touches[0];
+            setDragging(true);
+            setStart({ x: t.clientX - offset.x, y: t.clientY - offset.y });
+            updateFocusFromEvent(t.clientX, t.clientY);
+          }
         }}
         onTouchMove={(e) => {
-          const t = e.touches[0];
-          updateFocusFromEvent(t.clientX, t.clientY);
-          if (!dragging) return;
-          setOffset({ x: t.clientX - start.x, y: t.clientY - start.y });
+          if (e.touches.length === 2 && pinchRef.current) {
+            e.preventDefault();
+            const [t1, t2] = [e.touches[0], e.touches[1]];
+            const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+            const factor = dist / pinchRef.current.initialDistance;
+            const desiredZoom = clampZoom(pinchRef.current.initialZoom * factor);
+            const centerX = (t1.clientX + t2.clientX) / 2;
+            const centerY = (t1.clientY + t2.clientY) / 2;
+            const rect = svgRef.current?.getBoundingClientRect();
+            if (!rect) return;
+            const model = pinchRef.current.modelCenter;
+            const offsetX = centerX - rect.left - model.x * desiredZoom;
+            const offsetY = centerY - rect.top - model.y * desiredZoom;
+            setZoom(desiredZoom);
+            setOffset({ x: offsetX, y: offsetY });
+          } else if (e.touches.length === 1) {
+            e.preventDefault();
+            const t = e.touches[0];
+            updateFocusFromEvent(t.clientX, t.clientY);
+            if (!dragging) return;
+            setOffset({ x: t.clientX - start.x, y: t.clientY - start.y });
+          }
         }}
-        onTouchEnd={() => setDragging(false)}
+        onTouchEnd={(e) => {
+          pinchRef.current = null;
+          if (e.touches.length === 0) {
+            setDragging(false);
+          }
+        }}
+        onTouchCancel={() => {
+          pinchRef.current = null;
+          setDragging(false);
+        }}
       >
         <defs>
           <linearGradient id="sea" x1="0" x2="1" y1="0" y2="1">
@@ -372,4 +438,8 @@ function matchCountryByName(name?: string) {
   const target = slugName(name);
   const found = countries.find((c) => slugName(c.name) === target);
   return found?.iso ?? "";
+}
+
+function clampZoom(value: number) {
+  return Math.min(Math.max(value, 1.1), 50);
 }
